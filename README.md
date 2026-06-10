@@ -71,5 +71,3 @@ If the device does not detect any known network, it will act as a Wi-Fi Access P
 └── 📄 MANUAL_USUARIO.pdf     # User manual in PDF format for printing/operators
 ```
 ***
-
-Si quieres, ahora te puedo ayudar a **traducir la guía de compilación (`COMPILATION.md`)** o podemos redactar el **texto breve de presentación (About)** en inglés para tu repositorio. ¿Qué te parece?
