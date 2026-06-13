@@ -1,6 +1,6 @@
 # 📡 Sistema Tally Inalámbrico ESP32
 
-[![Firmware Version](https://img.shields.io/badge/Firmware-v1.1--Anti--Lag-blue.svg)](https://github.com/miguel-alegria14/tally-esp32-tallyarbiter/)
+[![Firmware Version](https://img.shields.io/badge/Firmware-v1-blue.svg)](https://github.com/miguel-alegria14/tally-esp32-tallyarbiter/)
 [![Compatible con](https://img.shields.io/badge/Compatible%20con-Tally%20Arbiter%203.x-orange.svg)](https://github.com/miguel-alegria14/tally-esp32-tallyarbiter/)
 [![Platform](https://img.shields.io/badge/Plataforma-ESP32-green.svg)](https://espressif.com)
 
