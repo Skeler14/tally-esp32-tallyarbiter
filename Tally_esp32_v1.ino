@@ -6,7 +6,7 @@
 #include <Arduino_JSON.h>
 #include <Preferences.h>
 #include <Ticker.h>
-#include <esp_wifi.h> // Librería nativa para controlar la potencia de la radio
+#include <esp_wifi.h>
 
 /* VARIABLES DE CONFIGURACIÓN DEL USUARIO */
 bool CUT_BUS = true; 
@@ -16,13 +16,20 @@ int tallyarbiter_port;
 String TALLY_DEVICE_ID;
 String wifi_ssid = "";
 String wifi_pass = "";
+String device_id_list = "0e59aba8"; 
 
+// CONFIGURACIÓN DE PINES
+const int PIN_BUTTON = 0;    // Pin del pulsador (Pulsado = LOW)
 const int PIN_PROGRAM = 25;  
 const int PIN_PREVIEW = 26;  
 const int PIN_STATUS = 33;   
 
+// Variables optimizadas para el control del botón (Tiempos reducidos a la mitad)
+unsigned long buttonPressStartTime = 0;
+bool isButtonPressed = false;
+bool action4SecTriggered = false; 
+
 int adcRawValue = 0;
-int detectedPin = 35;
 bool noMeasurementHardware = false;
 bool isCharging = false;
 int ultimoPorcentajeBateria = -1; 
@@ -148,6 +155,11 @@ void SetDeviceName() {
       break;
     }
   }
+  
+  preferences.begin("tally-names", false);
+  preferences.putString(DeviceId.c_str(), DeviceName);
+  preferences.end();
+
   preferences.begin("tally-arbiter", false);
   preferences.putString("devicename", DeviceName);
   preferences.end();
@@ -185,8 +197,8 @@ void processTallyData() {
 
 void socket_Flash() {
   for(int i = 0; i < 4; i++) {
-    digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); delay(80);
-    digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, HIGH); delay(80);
+    digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); delay(250);
+    digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, HIGH); delay(250);
   }
   digitalWrite(PIN_PREVIEW, LOW); lastTallyState = -1; evaluateMode();
 }
@@ -235,6 +247,12 @@ void connectToServer() {
 }
 
 void apagarTallyPorSoftware() {
+  Serial.println("[SYSTEM] Esperando a que se suelte el boton para apagar seguro...");
+  while(digitalRead(PIN_BUTTON) == LOW) {
+    delay(10);
+  }
+  
+  Serial.println("[SYSTEM] Boton liberado. Apagando ahora.");
   for(int i = 0; i < 10; i++) {
     digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); delay(60);
     digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, HIGH); delay(60);
@@ -257,16 +275,26 @@ void iniciarModoAP() {
   mode_preview = false;
   lastTallyState = 0;
 
-  iniciarParpadeo(0.1); 
-  WiFi.disconnect();
-  WiFi.mode(WIFI_AP_STA); 
+  iniciarParpadeo(0.5); 
+  
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_AP); 
   
   IPAddress local_IP(192, 168, 4, 1);
   IPAddress gateway(192, 168, 4, 1);
   IPAddress subnet(255, 255, 255, 0);
   WiFi.softAPConfig(local_IP, gateway, subnet);
   
-  WiFi.softAP("Config-Tally-AP");
+  WiFi.softAP("TallyConfig");
+  delay(200);
+
+  MDNS.end();
+  if (MDNS.begin("configurar-tally1")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("[mDNS] Modo AP Listo en http://configurar-tally1.local");
+  }
+  
   setupWebServer();
 }
 
@@ -280,6 +308,41 @@ void setupWebServer() {
     } else {
       batHtml = generarHtmlBateria();
     }
+
+    String selectOptionsHtml = "";
+    String listaClon = device_id_list;
+    
+    preferences.begin("tally-names", true); 
+
+    while (listaClon.length() > 0) {
+      int index = listaClon.indexOf(',');
+      String idItem = "";
+      if (index == -1) {
+        idItem = listaClon;
+        listaClon = "";
+      } else {
+        idItem = listaClon.substring(0, index);
+        listaClon = listaClon.substring(index + 1);
+      }
+      idItem.trim();
+      if (idItem.length() > 0) {
+        String selectedAttr = (idItem == TALLY_DEVICE_ID) ? "selected" : "";
+        
+        String savedName = preferences.getString(idItem.c_str(), "");
+        String displayName = "";
+        
+        if (idItem == TALLY_DEVICE_ID && DeviceName != "No Asignado") {
+          displayName = DeviceName + " (" + idItem + ")";
+        } else if (savedName.length() > 0) {
+          displayName = savedName + " (" + idItem + ")";
+        } else {
+          displayName = idItem; 
+        }
+        
+        selectOptionsHtml += "<option value='" + idItem + "' " + selectedAttr + ">" + displayName + "</option>";
+      }
+    }
+    preferences.end();
 
     String html = R"html(
 <!DOCTYPE html>
@@ -295,9 +358,12 @@ void setupWebServer() {
     .form-group { margin-bottom: 16px; }
     label { display: block; margin-bottom: 6px; font-size: 13px; color: #94a3b8; }
     .input-btn-container { position: relative; display: flex; align-items: center; gap: 8px; }
-    input[type='text'], input[type='password'] { width: 100%; padding: 11px 14px; border: 1px solid #334155; background-color: #0f111a; color: #ffffff; border-radius: 8px; box-sizing: border-box; font-size: 15px; }
-    .btn-inline { background-color: #334155; border: 1px solid #475569; color: white; padding: 11px 14px; border-radius: 8px; cursor: pointer; font-size: 15px; display: flex; align-items: center; justify-content: center; min-width: 46px; box-sizing: border-box; }
+    input[type='text'], input[type='password'], select { width: 100%; padding: 11px 14px; border: 1px solid #334155; background-color: #0f111a; color: #ffffff; border-radius: 8px; box-sizing: border-box; font-size: 15px; }
+    select { appearance: none; cursor: pointer; background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="white" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg>'); background-repeat: no-repeat; background-position: right 12px center; padding-right: 40px; }
+    .btn-inline { background-color: #334155; border: 1px solid #475569; color: white; padding: 11px 14px; border-radius: 8px; cursor: pointer; font-size: 15px; display: flex; align-items: center; justify-content: center; min-width: 46px; box-sizing: border-box; user-select: none; }
     .btn-inline:hover { background-color: #475569; }
+    .btn-delete { background-color: #7f1d1d; border-color: #991b1b; }
+    .btn-delete:hover { background-color: #991b1b; }
     .toggle-pass { position: absolute; right: 12px; cursor: pointer; color: #94a3b8; user-select: none; font-size: 14px; font-weight: bold; }
     input[type='submit'] { width: 100%; padding: 14px; background-color: #10b981; color: #ffffff; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 10px; }
     input[type='submit']:hover { background-color: #059669; }
@@ -312,6 +378,11 @@ void setupWebServer() {
     .btn-check-bat { background-color: #475569; border: 1px solid #64748b; width: 100%; padding: 11px; margin-bottom: 15px; font-size: 13px; }
     .btn-check-bat:hover { background-color: #64748b; }
     
+    /* Estilos del Bloque de Créditos */
+    .credits-box { margin-top: 25px; text-align: center; font-size: 13.5px; color: #94a3b8; border-top: 1px solid #2d3142; padding-top: 15px; line-height: 1.6; }
+    .credits-link { color: #25d366; text-decoration: none; font-weight: 600; }
+    .credits-link:hover { text-decoration: underline; }
+
     .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(15,17,26,0.85); align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }
     .modal-content { background-color: #1a1d29; border: 1px solid #334155; border-radius: 16px; width: 100%; max-width: 380px; padding: 24px; box-sizing: border-box; box-shadow: 0 20px 40px rgba(0,0,0,0.6); }
     .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
@@ -372,16 +443,50 @@ void setupWebServer() {
       document.getElementById("loadingOverlay").style.display = "flex";
     }
 
+    // Ejecuta comandos y retorna al menú principal de forma segura
     function enviarComandoSegundoPlano(ruta, titulo, subtitulo) {
       mostrarCargando(titulo, subtitulo);
-      fetch(ruta).catch(err => console.log("OK"));
+      fetch(ruta)
+        .then(() => procesarRetornoAcciones(ruta))
+        .catch(() => procesarRetornoAcciones(ruta));
+    }
+
+    function procesarRetornoAcciones(ruta) {
+      if (ruta === '/gotsleep') {
+        setTimeout(function() { window.close(); }, 4000);
+      } else if (ruta === '/gotreset') {
+        setTimeout(function() { window.location.href = 'http://192.168.4.1'; }, 3000);
+      } else {
+        setTimeout(function() { window.location.reload(); }, 1500);
+      }
+    }
+
+    function borrarIdSeleccionado() {
+      var select = document.getElementById("device_select");
+      var idABorrar = select.value;
+      if (confirm("¿Estás seguro de que quieres borrar el ID '" + idABorrar + "' del desplegable?")) {
+        mostrarCargando("Borrando ID", "Actualizando lista...");
+        fetch("/deleteid?id=" + encodeURIComponent(idABorrar))
+          .then(() => { setTimeout(function() { window.location.reload(); }, 1000); });
+      }
+    }
+
+    function copiarSelectAInput() {
+      var select = document.getElementById("device_select");
+      document.getElementById("device_input").value = select.value;
     }
 
     function guardarConfiguracion(event) {
       event.preventDefault(); 
       mostrarCargando('Guardando Datos', 'El Tally se está reiniciando...');
       var formData = new FormData(document.getElementById("configForm"));
-      fetch("/save", { method: "POST", body: formData }).catch(err => console.log("Reset OK"));
+      fetch("/save", { method: "POST", body: formData })
+        .then(() => {
+          setTimeout(function() { window.location.href = window.location.origin; }, 3500);
+        })
+        .catch(() => {
+          setTimeout(function() { window.location.href = window.location.origin; }, 3500);
+        });
     }
 
     function consultarBateriaManual() {
@@ -438,13 +543,31 @@ void setupWebServer() {
         <label>Puerto Servidor:</label>
         <input type='text' name='port' value='%TALLY_PORT%'>
       </div>
+      
       <div class='form-group'>
-        <label>Device ID:</label>
-        <input type='text' name='deviceid' value='%TALLY_DEVICE_ID%'>
+        <label>Seleccionar ID existente en memoria:</label>
+        <div class='input-btn-container'>
+          <select id='device_select' onchange='copiarSelectAInput()'>
+            %SELECT_OPTIONS%
+          </select>
+          <button type='button' class='btn-inline btn-delete' title='Borrar este ID' onclick='borrarIdSeleccionado()'>🗑️</button>
+        </div>
       </div>
+
+      <div class='form-group'>
+        <label>Device ID activo (Escribe uno nuevo o usa el desplegable):</label>
+        <input type='text' id='device_input' name='deviceid' value='%TALLY_DEVICE_ID%' placeholder='Ej: CAM1' required>
+        <span style='font-size: 13px; font-weight: 500; color: #f1f5f9; margin-top: 6px; display: block;'>Vinculado a red: <b style='color: #3b82f6;'>%DEVICE_NAME%</b></span>
+      </div>
+      
       <input type='submit' value='Guardar y Conectar Tally'>
     </form>
     %EXTRA_BUTTONS%
+    
+    <div class='credits-box'>
+      Desarrollado por: <b>Miguel Alegria</b><br>
+      Soporte técnico: <a class='credits-link' href='https://wa.me/573015329313' target='_blank' rel='noopener noreferrer'>+57 3015329313 (Solo WhatsApp)</a>
+    </div>
   </div>
 
   <div id="wifiModal" class="modal">
@@ -472,6 +595,8 @@ void setupWebServer() {
     html.replace("%TALLY_HOST%", tallyarbiter_host);
     html.replace("%TALLY_PORT%", String(tallyarbiter_port));
     html.replace("%TALLY_DEVICE_ID%", TALLY_DEVICE_ID);
+    html.replace("%DEVICE_NAME%", DeviceName); 
+    html.replace("%SELECT_OPTIONS%", selectOptionsHtml);
 
     if (!isAPMode) {
       html.replace("%BUTTON_CHECK_BAT%", "<button id='btnBat' class='btn-action btn-check-bat' onclick='consultarBateriaManual()'>Ver nivel de batería (Dar para actualizar)</button>");
@@ -519,12 +644,75 @@ void setupWebServer() {
     WiFi.scanDelete(); 
   });
 
+  server.on("/deleteid", HTTP_GET, []() {
+    if (server.hasArg("id")) {
+      String idABorrar = server.arg("id");
+      idABorrar.trim();
+      
+      String nuevaLista = "";
+      String listaClon = device_id_list;
+      while (listaClon.length() > 0) {
+        int index = listaClon.indexOf(',');
+        String idItem = "";
+        if (index == -1) {
+          idItem = listaClon;
+          listaClon = "";
+        } else {
+          idItem = listaClon.substring(0, index);
+          listaClon = listaClon.substring(index + 1);
+        }
+        idItem.trim();
+        if (idItem.length() > 0 && idItem != idABorrar) {
+          if (nuevaLista.length() > 0) nuevaLista += ",";
+          nuevaLista += idItem;
+        }
+      }
+      
+      if(nuevaLista.length() == 0) nuevaLista = "0e59aba8"; 
+      device_id_list = nuevaLista;
+      
+      preferences.begin("tally-arbiter", false);
+      preferences.putString("idlist", device_id_list);
+      if (TALLY_DEVICE_ID == idABorrar) {
+        int primerComa = device_id_list.indexOf(',');
+        TALLY_DEVICE_ID = (primerComa == -1) ? device_id_list : device_id_list.substring(0, primerComa);
+        preferences.putString("deviceid", TALLY_DEVICE_ID);
+        preferences.putString("devicename", "No Asignado");
+      }
+      preferences.end();
+
+      preferences.begin("tally-names", false);
+      preferences.remove(idABorrar.c_str());
+      preferences.end();
+    }
+    server.send(200, "text/plain", "OK");
+  });
+
   server.on("/save", HTTP_POST, []() {
     if (server.hasArg("ssid")) wifi_ssid = server.arg("ssid");
     if (server.hasArg("pass")) wifi_pass = server.arg("pass");
     if (server.hasArg("host")) tallyarbiter_host = server.arg("host");
     if (server.hasArg("port")) tallyarbiter_port = server.arg("port").toInt();
-    if (server.hasArg("deviceid")) TALLY_DEVICE_ID = server.arg("deviceid");
+    
+    if (server.hasArg("deviceid")) {
+      TALLY_DEVICE_ID = server.arg("deviceid");
+      TALLY_DEVICE_ID.trim();
+      
+      bool existe = false;
+      String listaClon = device_id_list;
+      while (listaClon.length() > 0) {
+        int index = listaClon.indexOf(',');
+        String idItem = (index == -1) ? listaClon : listaClon.substring(0, index);
+        listaClon = (index == -1) ? "" : listaClon.substring(index + 1);
+        idItem.trim();
+        if (idItem == TALLY_DEVICE_ID) { existe = true; break; }
+      }
+      
+      if (!existe && TALLY_DEVICE_ID.length() > 0) {
+        if (device_id_list.length() > 0) device_id_list += ",";
+        device_id_list += TALLY_DEVICE_ID;
+      }
+    }
 
     preferences.begin("tally-arbiter", false);
     preferences.putString("ssid", wifi_ssid);
@@ -532,6 +720,8 @@ void setupWebServer() {
     preferences.putString("host", tallyarbiter_host);
     preferences.putInt("port", tallyarbiter_port);
     preferences.putString("deviceid", TALLY_DEVICE_ID);
+    preferences.putString("idlist", device_id_list);
+    preferences.putString("devicename", "Actualizando..."); 
     preferences.end();
 
     server.send(200, "text/plain", "OK");
@@ -551,16 +741,21 @@ void setupWebServer() {
     iniciarModoAP();
   });
 
+  server.stop(); 
   server.begin();
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(600); 
+  
+  Serial.println("\n[WIFI] Inicializando en modo Estacion (STA)...");
   
   pinMode(PIN_PROGRAM, OUTPUT);
   pinMode(PIN_PREVIEW, OUTPUT);
   pinMode(PIN_STATUS, OUTPUT); 
   
+  pinMode(PIN_BUTTON, INPUT_PULLUP); 
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); 
   
   pinMode(35, INPUT);
@@ -575,16 +770,16 @@ void setup() {
   preferences.begin("tally-arbiter", false);
   tallyarbiter_host = preferences.getString("host", "192.168.10.107");
   tallyarbiter_port = preferences.getInt("port", 4455);
-  TALLY_DEVICE_ID = preferences.getString("deviceid", "0e59aba8");
+  TALLY_DEVICE_ID = preferences.getString("deviceid", "0e59aba8"); 
   wifi_ssid = preferences.getString("ssid", "");
   wifi_pass = preferences.getString("pass", "");
+  device_id_list = preferences.getString("idlist", "0e59aba8");
   if(preferences.getString("devicename").length() > 0){
     DeviceName = preferences.getString("devicename");
   }
   preferences.end();
 
   DeviceId = TALLY_DEVICE_ID;
-
   getBatteryPercentage();
 
   if (wifi_ssid.length() > 0) {
@@ -602,13 +797,14 @@ void setup() {
     networkConnected = true;
     lastWiFiConnectedTime = millis();
     
-    // --- OPTIMIZACIÓN DE HARDWARE ANTIMODULACIÓN POR BATERÍA ---
-    WiFi.setSleep(false); // Desactiva el modo reposo del módem WiFi
-    esp_wifi_set_ps(WIFI_PS_NONE); // Configura la radio a máxima potencia constante (No Lag)
+    WiFi.setSleep(false); 
+    esp_wifi_set_ps(WIFI_PS_NONE); 
     
+    MDNS.end();
     if (MDNS.begin("configurar-tally1")) {
       MDNS.addService("http", "tcp", 80);
     }
+    
     setupWebServer();
     connectToServer();
   }
@@ -616,6 +812,39 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  // --- CONTROL DEL BOTÓN FÍSICO CON TIEMPOS OPTIMIZADOS A LA MITAD ---
+  int buttonState = digitalRead(PIN_BUTTON);
+  
+  if (buttonState == LOW) { // Botón presionado
+    if (!isButtonPressed) {
+      isButtonPressed = true;
+      buttonPressStartTime = millis();
+      action4SecTriggered = false;
+    }
+    
+    unsigned long pressDuration = millis() - buttonPressStartTime;
+    
+    // Si cruza los 4 segundos, el RESET de WiFi se dispara de inmediato (Modo AP)
+    if (pressDuration >= 4000 && !action4SecTriggered) {
+      action4SecTriggered = true;
+      Serial.println("[BUTTON] Detectados 4 segundos. Abriendo Modo AP...");
+      iniciarModoAP();
+    }
+  } 
+  else { // El botón se suelta (HIGH)
+    if (isButtonPressed) {
+      unsigned long finalDuration = millis() - buttonPressStartTime;
+      isButtonPressed = false; 
+      
+      // Si se soltó entre los 1.5 y los 4 segundos, apaga el Tally de forma segura
+      if (finalDuration >= 1500 && finalDuration < 4000 && !action4SecTriggered) {
+        Serial.println("[BUTTON] Soltado tras 1.5+ segundos. Apagando Tally...");
+        apagarTallyPorSoftware();
+      }
+    }
+  }
+  // ------------------------------------------------------------------
 
   if (!isAPMode) {
     if (WiFi.status() == WL_CONNECTED) {
@@ -626,13 +855,11 @@ void loop() {
       }
     }
 
-    // PROTECCIÓN EN SEGUNDO PLANO: Revisa la batería cada 5 minutos
     static unsigned long lastBatteryCheck = 0;
     if (millis() - lastBatteryCheck >= 300000) { 
       lastBatteryCheck = millis();
       int bateriaActual = getBatteryPercentage();
       
-      // Condición estricta: Solo alerta cuando cae al 10% o menos
       if (!noMeasurementHardware && !isCharging && bateriaActual <= 10 && bateriaActual > 0) {
         if (!lowBatteryAlert) { 
           lowBatteryAlert = true; 
