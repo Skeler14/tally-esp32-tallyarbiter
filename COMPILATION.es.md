@@ -2,7 +2,7 @@
 
 Guía técnica orientada exclusivamente a desarrolladores, ingenieros de firmware o personal de soporte técnico encargado de compilar, depurar y realizar el despliegue del código fuente.
 
-[![Document Version](https://img.shields.io/badge/Firmware-v1.1-blue.svg)](#)
+[![Document Version](https://img.shields.io/badge/Firmware-v1-blue.svg)](#)
 [![Core Compatibility](https://img.shields.io/badge/esp32--core-2.0.17-orange.svg)](#)
 
 ## 1. Preparación del Entorno (Arduino IDE)
