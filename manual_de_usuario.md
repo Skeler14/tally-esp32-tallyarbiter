@@ -59,7 +59,7 @@ Si el dispositivo no encuentra red, desplegará su propio portal:
 
 ---
 
-## 5. Panel de Control Web v1.1 🖥️
+## 5. Panel de Control Web v1 🖥️
 Acceda mediante: `http://configurar-tally1.local/`
 
 * **Batería:** Presione **"Ver nivel de batería"** para una petición AJAX rápida 🔋.
