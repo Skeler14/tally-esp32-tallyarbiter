@@ -2,7 +2,7 @@
 
 Operational guide and technical overview for camera operators, stage technicians, and video engineers utilizing the **LOLIN32 (ESP32)** wireless Tally hardware platform.
 
-[![Firmware Version](https://img.shields.io/badge/Firmware-v1.1--Anti--Lag-blue.svg)](#)
+[![Firmware Version](https://img.shields.io/badge/Firmware-v1-blue.svg)](#)
 [![Compatibility](https://img.shields.io/badge/Compatible%20with-Tally%20Arbiter%203.x%20--%204.x-orange.svg)](#)
 
 ---
