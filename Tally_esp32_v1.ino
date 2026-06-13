@@ -1,657 +1,591 @@
-/*
- * ============================================================
- * TALLY ARBITER — ESP32 Firmware v1.0
- * Hardware: LOLIN32 (ESP32)
- * Compatible: Tally Arbiter 3.x (Socket.IO sobre WebSocket)
- * Autor: Miguel Alegria
- * ============================================================
- */
-
 #include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <WebSocketsClient.h>
 #include <SocketIOclient.h>
-#include <ArduinoJson.h>
-#include <WiFiManager.h>
-#include <ArduinoOTA.h>
+#include <Arduino_JSON.h>
 #include <Preferences.h>
-#include <esp_adc_cal.h>
-#include "driver/adc.h"   // FIX: adc1_config_width / adc1_get_raw viven aquí. Sin esto no compila en algunos cores 3.x.
-#include <esp_sleep.h>
-#include "esp_bt.h"
-#include "esp_wifi.h" // Necesario para el control directo de la radio PHY
+#include <Ticker.h>
 
-// ============================================================
-// PINES
-// ============================================================
-const int PIN_PROGRAM  = 25;
-const int PIN_PREVIEW  = 26;
-const int PIN_BAT_LED  = 27;
-const int PIN_BAT_ADC  = 35;
-const int PIN_BOOT_BTN = 0;
+/* VARIABLES DE CONFIGURACIÓN DEL USUARIO */
+bool CUT_BUS = true; // true = Program + Preview = Tally Rojo; false = Program + Preview = Tally Amarillo
 
-// ============================================================
-// CONFIGURACIÓN DE TIMERS Y THRESHOLDS
-// ============================================================
-const unsigned long DEEP_SLEEP_TIMEOUT_MS       = 10UL * 60UL * 1000UL;
-const unsigned long INITIAL_CONN_TIMEOUT_MS     = 45UL * 1000UL;
-const uint64_t      DEEP_SLEEP_WAKE_INTERVAL_US = 30ULL * 1000000ULL;
-const unsigned long LINK_WATCHDOG_TIMEOUT_MS    = 20000UL;
+// Parámetros dinámicos del Tally
+String tallyarbiter_host;
+int tallyarbiter_port;
+String TALLY_DEVICE_ID;
+String wifi_ssid = "";
+String wifi_pass = "";
 
-const int  BATTERY_LOW_THRESHOLD  = 10;
-const float VDIV_FACTOR            = 2.0f;
-const unsigned long BATTERY_INTERVAL_MS = 60000;
+/* ASIGNACIÓN DE PINES FÍSICOS */
+const int PIN_PROGRAM = 25;  // LED Rojo
+const int PIN_PREVIEW = 26;  // LED Verde
+const int PIN_STATUS = 33;   // LED Azul de Estado
 
-const int TA_DEFAULT_PORT = 4455;
+/* VARIABLES GLOBALES DE DIAGNÓSTICO DE ENERGÍA */
+int adcRawValue = 0;
+int detectedPin = 35;
+bool noMeasurementHardware = false;
+bool isCharging = false;
 
-const unsigned long BLINK_INTERVAL     = 500;
-const unsigned long RED_BLINK_INTERVAL = 200;
-const unsigned long BASE_RECONNECT_INTERVAL = 5000; // Intervalo base para Backoff
+/* CONTROL DE TIEMPOS Y ESTADOS */
+unsigned long lastWiFiConnectedTime = 0;
+int lastTallyState = -1; 
+bool isAPMode = false;
 
-const unsigned long BTN_DEBOUNCE_MS     = 50;
-const unsigned long BTN_SHUTDOWN_MS     = 5000;
-const unsigned long BTN_FORCE_PORTAL_MS = 10000;
+// Estados de control de alertas
+bool socketConnected = false;
+bool lowBatteryAlert = false;
 
-// ============================================================
-// ESTRUCTURAS Y MEMORIA GLOBAL
-// ============================================================
-SocketIOclient socketIO;
-Preferences   prefs;
-WiFiManager    wm;
-esp_adc_cal_characteristics_t adcChars;
+Preferences preferences;
+WebServer server(80);
+SocketIOclient socket;
+Ticker statusTicker; 
 
-// DEFINICIÓN ANTICIPADA DEL ENUM (Resuelve el error de compilación en el IDE de Arduino)
-enum AnimState : uint8_t { ANIM_NONE = 0, ANIM_CONN_SUCCESS, ANIM_FLASH };
+JSONVar BusOptions;
+JSONVar Devices;
+JSONVar DeviceStates;
+String DeviceId = "unassigned";
+String DeviceName = "No Asignado";
+String ListenerType = "esp32-tally"; 
 
-char ta_host[64]   = "192.168.10.104";
-char device_id[32] = "IRIUN1";
-int  ta_port       = TA_DEFAULT_PORT;
-char portStr[8];
+bool mode_preview = false;
+bool mode_program = false;
+bool networkConnected = false;
 
-WiFiManagerParameter param_host("host",   "IP TallyArbiter", ta_host,   64);
-WiFiManagerParameter param_devid("devId", "Device ID",       device_id, 32);
-WiFiManagerParameter param_port("port",  "Puerto",          portStr,   6);
-
-struct BusEntry { char id[48]; char type[16]; };
-BusEntry busMap[16]; 
-int      busMapCount = 0;
-
-// Buffer estático de uso exclusivo en el hilo síncrono (Core 1)
-DynamicJsonDocument doc(4096);
-
-// Mutex nativo para sincronizar accesos a variables compartidas entre Cores
-portMUX_TYPE idMux = portMUX_INITIALIZER_UNLOCKED;
-
-const char* getBusTypeById(const char* busId) {
-    for (int i = 0; i < busMapCount; i++) {
-        if (strcmp(busMap[i].id, busId) == 0) return busMap[i].type;
-    }
-    return "";
+// --- DECLARACIÓN O FUNCIONES EN ORDEN CRÍTICO ---
+void ws_emit(String event, String payload = "") {
+  String msg = (payload != "") ? "[\"" + event + "\"," + payload + "]" : "[\"" + event + "\"]";
+  socket.sendEVENT(msg);
 }
 
-// ============================================================
-// MÁQUINA DE ESTADOS Y ANIMACIONES
-// ============================================================
-AnimState    currentAnim  = ANIM_NONE;
-int          animStep     = 0;
-unsigned long animLastMs  = 0;
-const int     ANIM_CONN_STEPS  = 6;
-const int     ANIM_FLASH_STEPS = 6;
-const unsigned long ANIM_STEP_MS = 150;
-
-void startAnim(AnimState anim) {
-    currentAnim = anim;
-    animStep    = 0;
-    animLastMs  = millis();
+void cambiarEstadoLED() {
+  digitalWrite(PIN_STATUS, !digitalRead(PIN_STATUS));
 }
 
-bool isConnected           = false;
-bool everConnectedThisBoot = false;
-bool isTallyProgram        = false;
-bool isTallyPreview        = false;
-bool batteryLow            = false;
-bool lastProgramState      = false;
-bool lastPreviewState      = false;
+void iniciarParpadeo(float segundos) {
+  statusTicker.detach(); 
+  statusTicker.attach(segundos, cambiarEstadoLED);
+}
 
-// Timers de control independientes
-unsigned long lastWiFiAliveTime    = 0; 
-unsigned long lastSocketAliveTime  = 0; 
-unsigned long lastBatteryCheck     = 0;
-unsigned long lastReconnectAttempt = 0;
-unsigned long currentReconnectInterval = BASE_RECONNECT_INTERVAL; // Intervalo dinámico
-int           wifiRetryCount       = 0;
-
-// Banderas de reinicio diferido seguro
-bool          pendingRestart       = false;
-unsigned long restartTimer         = 0;
-
-// Control de flujo para actualizaciones OTA activas
-bool          isOtaUpdating        = false;
-
-unsigned long btnPressStart = 0;
-bool          btnHeld       = false;
-
-unsigned long lastBlinkTime    = 0; bool blinkState    = false;
-unsigned long lastRedBlinkTime = 0; bool redBlinkState = false;
-
-// ============================================================
-// ADC Y FILTRADO ANALÓGICO NATIVO
-// ============================================================
-void initADC() {
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_11); 
-    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adcChars);
+void apagarLED() {
+  statusTicker.detach();
+  digitalWrite(PIN_STATUS, LOW); 
 }
 
 int getBatteryPercentage() {
-    const int total_samples = 12;
-    uint32_t samples[total_samples];
-    
-    for (int i = 0; i < total_samples; i++) { 
-        samples[i] = adc1_get_raw(ADC1_CHANNEL_7); 
-        delayMicroseconds(50); 
-    }
-    
-    // Filtro de ordenamiento de burbuja para remover picos de ruido RF
-    for (int i = 1; i < total_samples; i++) {
-        uint32_t key = samples[i];
-        int j = i - 1;
-        while (j >= 0 && samples[j] > key) {
-            samples[j + 1] = samples[j];
-            j--;
-        }
-        samples[j + 1] = key;
-    }
-    
-    uint32_t raw_filtered = 0;
-    for (int i = 2; i < total_samples - 2; i++) {
-        raw_filtered += samples[i];
-    }
-    raw_filtered /= (total_samples - 4);
-    
-    // FIX: 'mv' era uint32_t. Con batería <3.5V, (mv-3500) hacía underflow sin signo y el % salía basura.
-    // Pasado a int con signo para que el tramo bajo dé 0% real en vez de un número enorme.
-    int mv = (int)(esp_adc_cal_raw_to_voltage(raw_filtered, &adcChars) * VDIV_FACTOR);
-    return constrain((mv - 3500) * 100 / (4150 - 3500), 0, 100);
+  long sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogRead(35);
+    delay(2);
+  }
+  adcRawValue = sum / 10;
+  if (adcRawValue < 500) {
+    noMeasurementHardware = true;
+    isCharging = false;
+    return -1;
+  }
+  noMeasurementHardware = false;
+  if (adcRawValue >= 2320) {
+    isCharging = true;
+    int percentage = map(adcRawValue, 2320, 2450, 85, 100);
+    return constrain(percentage, 0, 100);
+  } else {
+    isCharging = false;
+    int percentage = map(adcRawValue, 1900, 2310, 0, 100);
+    return constrain(percentage, 0, 100);
+  }
 }
 
-// ============================================================
-// CONTROLADOR DE LEDS
-// ============================================================
-void updateLEDs() {
-    unsigned long now = millis();
+void evaluateMode() {
+  int currentState = 0; 
+  if (mode_preview && !mode_program) currentState = 1;
+  else if (!mode_preview && mode_program) currentState = 2;
+  else if (mode_preview && mode_program) currentState = 3;
 
-    if (currentAnim != ANIM_NONE) {
-        if (now - animLastMs >= ANIM_STEP_MS) {
-            animLastMs = now;
-            bool on = (animStep % 2 == 0);
-            int totalSteps = (currentAnim == ANIM_CONN_SUCCESS) ? ANIM_CONN_STEPS : ANIM_FLASH_STEPS;
+  if (currentState == lastTallyState) return; 
+  lastTallyState = currentState;
 
-            if (currentAnim == ANIM_CONN_SUCCESS) {
-                digitalWrite(PIN_PREVIEW, on ? HIGH : LOW);
-                digitalWrite(PIN_PROGRAM, LOW);
-            } else { 
-                digitalWrite(PIN_PROGRAM, on ? HIGH : LOW);
-                digitalWrite(PIN_PREVIEW, on ? LOW  : HIGH);
-            }
+  if (currentState == 1) { digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, HIGH); }
+  else if (currentState == 2) { digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); }
+  else if (currentState == 3) {
+    if (CUT_BUS == true) { digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); }
+    else { digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, HIGH); }
+  }
+  else { digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, LOW); }
+}
 
-            if (++animStep >= totalSteps) {
-                currentAnim = ANIM_NONE;
-                animStep    = 0;
-                digitalWrite(PIN_PROGRAM, isTallyProgram ? HIGH : LOW);
-                digitalWrite(PIN_PREVIEW, isTallyPreview  ? HIGH : LOW);
-            }
-        }
+void SetDeviceName() {
+  for (int i = 0; i < Devices.length(); i++) {
+    if (JSON.stringify(Devices[i]["id"]) == "\"" + DeviceId + "\"") {
+      String strDevice = JSON.stringify(Devices[i]["name"]);
+      DeviceName = strDevice.substring(1, strDevice.length() - 1);
+      break;
+    }
+  }
+  preferences.begin("tally-arbiter", false);
+  preferences.putString("devicename", DeviceName);
+  preferences.end();
+  evaluateMode();
+}
+
+String getBusTypeById(String busId) {
+  for (int i = 0; i < BusOptions.length(); i++) {
+    if (JSON.stringify(BusOptions[i]["id"]) == busId) return JSON.stringify(BusOptions[i]["type"]);
+  }
+  return "invalid";
+}
+
+void processTallyData() {
+  String targetDeviceQuote = "\"" + DeviceId + "\""; 
+  for (int i = 0; i < DeviceStates.length(); i++) {
+    if (JSON.stringify(DeviceStates[i]["deviceId"]) != targetDeviceQuote) continue;
+    String busIdStr = JSON.stringify(DeviceStates[i]["busId"]);
+    String busType = getBusTypeById(busIdStr);
+    if (busType == "\"preview\"") mode_preview = (DeviceStates[i]["sources"].length() > 0);
+    if (busType == "\"program\"") mode_program = (DeviceStates[i]["sources"].length() > 0);
+  }
+  evaluateMode();
+}
+
+void socket_Flash() {
+  for(int i = 0; i < 4; i++) {
+    digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); delay(100);
+    digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, HIGH); delay(100);
+  }
+  digitalWrite(PIN_PREVIEW, LOW); lastTallyState = -1; evaluateMode();
+}
+
+void socket_event(socketIOmessageType_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case sIOtype_CONNECT:
+      socketConnected = true;
+      if (lowBatteryAlert) iniciarParpadeo(2.0); else apagarLED(); 
+      ws_emit("bus_options");
+      ws_emit("listenerclient_connect", "{\"deviceId\":\"" + DeviceId + "\",\"listenerType\":\"" + ListenerType + "\",\"canBeReassigned\":true,\"canBeFlashed\":true,\"supportsChat\":false}"); 
+      break;
+    case sIOtype_DISCONNECT:
+    case sIOtype_ERROR:
+      socketConnected = false;
+      break;
+    case sIOtype_EVENT: {
+      String msg = (char*)payload;
+      String typeStr = msg.substring(2, msg.indexOf("\"", 2));
+      String content = msg.substring(typeStr.length() + 4);
+      content.remove(content.length() - 1);
+
+      if (typeStr == "bus_options") BusOptions = JSON.parse(content);
+      if (typeStr == "flash") socket_Flash();
+      if (typeStr == "deviceId") { DeviceId = content.substring(1, content.length()-1); SetDeviceName(); }
+      if (typeStr == "devices") { Devices = JSON.parse(content); SetDeviceName(); }
+      if (typeStr == "device_states") { DeviceStates = JSON.parse(content); processTallyData(); }
+      break;
+    }
+    default: break;
+  }
+}
+
+void connectToServer() {
+  socket.onEvent(socket_event);
+  socket.begin(tallyarbiter_host.c_str(), tallyarbiter_port, "/socket.io/?EIO=3");
+}
+
+void apagarTallyPorSoftware() {
+  for(int i = 0; i < 10; i++) {
+    digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); delay(60);
+    digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, HIGH); delay(60);
+  }
+  digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, LOW); digitalWrite(PIN_STATUS, LOW);
+  socket.disconnect();
+  delay(150);
+  esp_deep_sleep_start();
+}
+
+void setupWebServer(); 
+
+void iniciarModoAP() {
+  isAPMode = true;
+  socketConnected = false;
+  
+  digitalWrite(PIN_PROGRAM, LOW);
+  digitalWrite(PIN_PREVIEW, LOW);
+  mode_program = false;
+  mode_preview = false;
+  lastTallyState = 0;
+
+  iniciarParpadeo(0.1); 
+  
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP_STA); 
+  
+  IPAddress local_IP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  
+  WiFi.softAP("Config-Tally-AP");
+  Serial.println("[TALLY] Modo AP iniciado. Entra a http://192.168.4.1");
+  
+  setupWebServer();
+}
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, []() {
+    int bat = getBatteryPercentage();
+    String batHtml = "";
+    
+    if (isAPMode) {
+      batHtml = "<div style='background: #0284c7; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #0369a1;'> "
+                "  <span style='color: #ffffff; font-weight: 600; font-size: 15px;'>📡 Modo Configuración AP Activo</span>"
+                "  <div style='font-size: 12px; color: #e0f2fe; margin-top: 6px;'>Introduce los datos abajo para conectar el Tally a tu red.</div>"
+                "</div>";
+    } else if (noMeasurementHardware) {
+      batHtml = "<div style='background: #2a1b1f; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #4a2328;'>"
+                "  <span style='color: #f87171; font-weight: 600; font-size: 15px;'>🔋 Alimentación: Activa (Modo Seguro)</span>"
+                "</div>";
+    } else if (isCharging) {
+      batHtml = "<div style='background: #112240; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #1d3557;'>"
+                "  <span style='color: #64ffda; font-weight: 600; font-size: 16px;'>⚡ Alimentación: USB / Cargando</span>"
+                "</div>";
     } else {
-        if (!isConnected) {
-            if (now - lastRedBlinkTime >= RED_BLINK_INTERVAL) {
-                lastRedBlinkTime = now; redBlinkState = !redBlinkState;
-                digitalWrite(PIN_PROGRAM, redBlinkState ? HIGH : LOW);
-            }
-            digitalWrite(PIN_PREVIEW, LOW);
-        } else {
-            digitalWrite(PIN_PROGRAM, isTallyProgram ? HIGH : LOW);
-            digitalWrite(PIN_PREVIEW, isTallyPreview  ? HIGH : LOW);
-        }
+      String color = "#10b981"; if (bat <= 15) color = "#ef4444";
+      batHtml = "<div style='background: #1e293b; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #334155;'>"
+                "  <span style='color: " + color + "; font-weight: 600; font-size: 16px;'>🔋 Batería: " + String(bat) + "%</span>"
+                "</div>";
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
-        if (now - lastBlinkTime >= BLINK_INTERVAL) {
-            lastBlinkTime = now; blinkState = !blinkState;
-            digitalWrite(PIN_BAT_LED, blinkState ? HIGH : LOW);
-        }
-    } else {
-        digitalWrite(PIN_BAT_LED, batteryLow ? HIGH : LOW);
+    String html = R"html(
+<!DOCTYPE html>
+<html lang='es'>
+<head>
+  <meta charset='UTF-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+  <title>Configuración Tally</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background-color: #0f111a; color: #e2e8f0; display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+    .card { background-color: #1a1d29; padding: 30px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); width: 100%; max-width: 420px; box-sizing: border-box; border: 1px solid #2d3142; position: relative; }
+    h2 { margin-top: 0; margin-bottom: 20px; color: #3b82f6; font-size: 24px; text-align: center; }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; margin-bottom: 6px; font-size: 13px; color: #94a3b8; }
+    .input-btn-container { position: relative; display: flex; align-items: center; gap: 8px; }
+    input[type='text'], input[type='password'] { width: 100%; padding: 11px 14px; border: 1px solid #334155; background-color: #0f111a; color: #ffffff; border-radius: 8px; box-sizing: border-box; font-size: 15px; }
+    .btn-inline { background-color: #334155; border: 1px solid #475569; color: white; padding: 11px 14px; border-radius: 8px; cursor: pointer; font-size: 15px; display: flex; align-items: center; justify-content: center; min-width: 46px; box-sizing: border-box; }
+    .btn-inline:hover { background-color: #475569; }
+    .toggle-pass { position: absolute; right: 12px; cursor: pointer; color: #94a3b8; user-select: none; font-size: 14px; font-weight: bold; }
+    input[type='submit'] { width: 100%; padding: 14px; background-color: #10b981; color: #ffffff; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 10px; }
+    input[type='submit']:hover { background-color: #059669; }
+    .btn-zone { display: flex; gap: 10px; margin-top: 15px; }
+    .btn-action { flex: 1; padding: 12px; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; color: white; text-align: center; text-decoration: none; user-select: none; }
+    .btn-sleep { background-color: #dc2626; }
+    .btn-sleep:hover { background-color: #b91c1c; }
+    .btn-wifi { background-color: #0284c7; }
+    .btn-wifi:hover { background-color: #0369a1; }
+    
+    /* MODAL DE ESCANEO */
+    .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(15,17,26,0.85); align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }
+    .modal-content { background-color: #1a1d29; border: 1px solid #334155; border-radius: 16px; width: 100%; max-width: 380px; padding: 24px; box-sizing: border-box; box-shadow: 0 20px 40px rgba(0,0,0,0.6); }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .modal-title { font-size: 18px; font-weight: 600; color: #3b82f6; }
+    .close-modal { color: #94a3b8; font-size: 22px; font-weight: bold; cursor: pointer; user-select: none; }
+    .close-modal:hover { color: #ffffff; }
+    .wifi-list { max-height: 240px; overflow-y: auto; margin-top: 10px; border-radius: 8px; border: 1px solid #2d3142; }
+    .wifi-item { padding: 12px 16px; border-bottom: 1px solid #2d3142; cursor: pointer; display: flex; justify-content: space-between; align-items: center; background-color: #11131c; font-size: 14px; }
+    .wifi-item:last-child { border-bottom: none; }
+    .wifi-item:hover { background-color: #24283b; color: #64ffda; }
+    .loading-text { text-align: center; padding: 20px; color: #94a3b8; font-size: 14px; }
+
+    /* PANTALLA GENERAL DE ACCIÓN / CARGA (LOADING OVERLAY) */
+    .loader-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: #0f111a; z-index: 9999; flex-direction: column; align-items: center; justify-content: center; color: white; }
+    .spinner { border: 4px solid rgba(255, 255, 255, 0.1); width: 50px; height: 50px; border-radius: 50%; border-left-color: #3b82f6; animation: spin 1s linear infinite; margin-bottom: 20px; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .loader-title { font-size: 22px; font-weight: 600; margin-bottom: 8px; color: #ffffff; text-align: center; }
+    .loader-subtitle { font-size: 14px; color: #94a3b8; text-align: center; max-width: 300px; }
+  </style>
+  <script>
+    function togglePassword() {
+      var x = document.getElementById("wifi_password");
+      var btn = document.getElementById("toggle_btn");
+      if (x.type === "password") { x.type = "text"; btn.innerHTML = "👁️"; } 
+      else { x.type = "password"; btn.innerHTML = "🙈"; }
     }
-}
 
-// ============================================================
-// GESTIÓN DE CONFIGURACIÓN NO VOLÁTIL (NVS)
-// ============================================================
-void loadConfig() {
-    prefs.begin("tally", true);
-    portENTER_CRITICAL(&idMux);
-    prefs.getString("host",  ta_host,   sizeof(ta_host));
-    prefs.getString("devId", device_id, sizeof(device_id));
-    ta_port = prefs.getInt("port", ta_port);
-    portEXIT_CRITICAL(&idMux);
-    prefs.end();
-}
+    function abrirBuscadorWiFi() {
+      document.getElementById("wifiModal").style.display = "flex";
+      var lista = document.getElementById("lista_redes");
+      lista.innerHTML = "<div class='loading-text'>⏳ Escaneando redes cercanas...<br><span style='font-size:11px;color:#64748b;'>Esto tomará unos 3 segundos</span></div>";
+      
+      fetch("/scan")
+        .then(response => response.json())
+        .then(data => {
+          lista.innerHTML = "";
+          if(data.length == 0) {
+            lista.innerHTML = "<div class='loading-text' style='color:#ef4444;'>No se encontraron redes de 2.4GHz.</div>";
+            return;
+          }
+          data.forEach(function(red) {
+            var div = document.createElement("div");
+            div.className = "wifi-item";
+            div.innerHTML = "<span>" + red.ssid + "</span><span style='color:#94a3b8;font-size:12px;'>" + red.rssi + "% 📶</span>";
+            div.onclick = function() {
+              document.getElementById("wifi_ssid_input").value = red.ssid;
+              cerrarModal();
+            };
+            lista.appendChild(div);
+          });
+        })
+        .catch(err => {
+          lista.innerHTML = "<div class='loading-text' style='color:#ef4444;'>Error al conectar con la placa.</div>";
+        });
+    }
 
-void saveConfig(const char* host, const char* devId, int port) {
-    prefs.begin("tally", false);
-    prefs.putString("host", host);
-    prefs.putString("devId", devId);
-    prefs.putInt("port", port);
-    prefs.end();
-}
+    function cerrarModal() {
+      document.getElementById("wifiModal").style.display = "none";
+    }
 
-void resetConfig() { prefs.begin("tally", false); prefs.clear(); prefs.end(); }
+    function mostrarCargando(titulo, subtitulo) {
+      document.getElementById("loader_title").innerText = titulo;
+      document.getElementById("loader_subtitle").innerText = subtitulo;
+      document.getElementById("loadingOverlay").style.display = "flex";
+    }
 
-// Callback aislado ejecutado desde el hilo HTTP asíncrono
-void saveParamsCallback() {
-    int p = atoi(param_port.getValue());
-    
-    portENTER_CRITICAL(&idMux);
-    saveConfig(param_host.getValue(), param_devid.getValue(), p);
-    strlcpy(ta_host, param_host.getValue(), sizeof(ta_host));
-    strlcpy(device_id, param_devid.getValue(), sizeof(device_id));
-    ta_port = p;
-    portEXIT_CRITICAL(&idMux);
+    function enviarComandoSegundoPlano(ruta, titulo, subtitulo) {
+      mostrarCargando(titulo, subtitulo);
+      fetch(ruta)
+        .then(res => console.log("Comando enviado."))
+        .catch(err => console.log("Reinicio procesado correctamente."));
+    }
 
-    Serial.println("[CONFIG] Configuración inyectada en NVS de forma segura.");
-    
-    pendingRestart = true;
-    restartTimer = millis();
-}
+    // NUEVO PARA MÓVILES: Captura los datos y los envía asíncronamente sin romper el HTML móvil
+    function guardarConfiguracion(event) {
+      event.preventDefault(); // Detiene por completo la redirección del navegador móvil
+      
+      mostrarCargando('Guardando Datos', 'El Tally se está reiniciando para conectar al nuevo WiFi...');
+      
+      var formData = new FormData(document.getElementById("configForm"));
+      
+      fetch("/save", {
+        method: "POST",
+        body: formData
+      })
+      .then(res => console.log("Configuración enviada."))
+      .catch(err => console.log("La placa se está reiniciando de forma segura."));
+    }
+  </script>
+</head>
+<body>
+  <div class='card'>
+    <h2>Configuración Tally</h2>
+    %BATTERY_SECTION%
+    <form id='configForm' onsubmit='guardarConfiguracion(event)'>
+      <div class='form-group'>
+        <label>Nombre de tu red WiFi (SSID):</label>
+        <div class='input-btn-container'>
+          <input type='text' id='wifi_ssid_input' name='ssid' value='%WIFI_SSID%' placeholder='Ej: MiRedHome_2.4G'>
+          <button type='button' class='btn-inline' onclick='abrirBuscadorWiFi()' title='Buscar redes cercanas'>🔍</button>
+        </div>
+      </div>
+      <div class='form-group'>
+        <label>Contraseña WiFi:</label>
+        <div class='input-btn-container'>
+          <input type='password' id='wifi_password' name='pass' value='%WIFI_PASS%'>
+          <span id='toggle_btn' class='toggle-pass' onclick='togglePassword()'>🙈</span>
+        </div>
+      </div>
+      <hr style='border-color: #2d3142; margin: 20px 0;'>
+      <div class='form-group'>
+        <label>IP Servidor Tally Arbiter:</label>
+        <input type='text' name='host' value='%TALLY_HOST%'>
+      </div>
+      <div class='form-group'>
+        <label>Puerto Servidor:</label>
+        <input type='text' name='port' value='%TALLY_PORT%'>
+      </div>
+      <div class='form-group'>
+        <label>Device ID:</label>
+        <input type='text' name='deviceid' value='%TALLY_DEVICE_ID%'>
+      </div>
+      <input type='submit' value='Guardar y Conectar Tally'>
+    </form>
+    %EXTRA_BUTTONS%
+  </div>
 
-void shutdownConfigPortal() {
-    wm.stopConfigPortal(); WiFi.softAPdisconnect(true); delay(100); WiFi.mode(WIFI_STA);
-}
+  <div id="wifiModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span class="modal-title">Redes Disponibles (2.4GHz)</span>
+        <span class="close-modal" onclick="cerrarModal()">&times;</span>
+      </div>
+      <div id="lista_redes" class="wifi-list"></div>
+    </div>
+  </div>
 
-// ============================================================
-// GESTIÓN DE ENERGÍA CRÍTICA
-// ============================================================
-void enterDeepSleep() {
-    Serial.println("[ENERGÍA] Modo Deep Sleep por inactividad activa.");
-    digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, LOW); digitalWrite(PIN_BAT_LED, LOW);
-    shutdownConfigPortal(); socketIO.disconnect();
-    WiFi.disconnect(false, false); WiFi.mode(WIFI_OFF); delay(200);
-    esp_sleep_enable_timer_wakeup(DEEP_SLEEP_WAKE_INTERVAL_US);
-    esp_deep_sleep_start();
-}
+  <div id="loadingOverlay" class="loader-overlay">
+    <div class="spinner"></div>
+    <div id="loader_title" class="loader-title">Procesando...</div>
+    <div id="loader_subtitle" class="loader-subtitle">Por favor espera un momento.</div>
+  </div>
 
-void enterShutdown() {
-    Serial.println("[ENERGÍA] Apagado manual solicitado.");
-    digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, LOW); digitalWrite(PIN_BAT_LED, LOW);
-    shutdownConfigPortal(); socketIO.disconnect();
-    WiFi.disconnect(false, false); WiFi.mode(WIFI_OFF); delay(300);
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BOOT_BTN, 0);
-    esp_deep_sleep_start();
-}
+</body>
+</html>
+)html";
 
-// ============================================================
-// EMISIÓN DE PROTOCOLO TALLY ARBITER
-// ============================================================
-void ws_emit(const char* event) {
-    String msg = String("[\"") + event + "\"]";
-    socketIO.sendEVENT(msg);
-}
+    html.replace("%BATTERY_SECTION%", batHtml);
+    html.replace("%WIFI_SSID%", wifi_ssid);
+    html.replace("%WIFI_PASS%", wifi_pass);
+    html.replace("%TALLY_HOST%", tallyarbiter_host);
+    html.replace("%TALLY_PORT%", String(tallyarbiter_port));
+    html.replace("%TALLY_DEVICE_ID%", TALLY_DEVICE_ID);
 
-void sendListenerConnect() {
-    // FIX CRÍTICO: el servidor lee obj.deviceId / obj.listenerType / obj.canBe... (UN OBJETO).
-    // El código anterior mandaba argumentos sueltos -> TA recibía deviceId = undefined,
-    // el equipo nunca quedaba registrado y nunca llegaban los device_states (no encendía).
-    // Wire correcto:  ["listenerclient_connect", { ... }]
-    StaticJsonDocument<256> txDoc;
-    JsonArray arr = txDoc.to<JsonArray>();
-    arr.add("listenerclient_connect");
-    JsonObject o = arr.createNestedObject();
+    String extraButtons = "";
+    if (!isAPMode) {
+      extraButtons = R"html(
+      <div class='btn-zone'>
+        <button class='btn-action btn-sleep' onclick="enviarComandoSegundoPlano('/gotsleep', '🔴 Apagando Tally', 'El dispositivo está entrando en modo de reposo profundo seguro.')">🔴 Apagar Tally</button>
+        <button class='btn-action btn-wifi' onclick="enviarComandoSegundoPlano('/gotreset', '🔄 Abriendo Modo AP', 'Desconectando de la red actual y levantando portal local en http://192.168.4.1')">🔄 Resetear WiFi</button>
+      </div>
+      )html";
+    }
+    html.replace("%EXTRA_BUTTONS%", extraButtons);
 
-    portENTER_CRITICAL(&idMux);
-    o["deviceId"] = device_id;
-    portEXIT_CRITICAL(&idMux);
+    server.send(200, "text/html", html);
+  });
 
-    o["listenerType"]    = "esp32-tally";
-    o["canBeReassigned"] = true;
-    o["canBeFlashed"]    = true;
-    o["supportsChat"]    = false;
-
-    String msg;
-    serializeJson(txDoc, msg);
-    socketIO.sendEVENT(msg);
-}
-
-void sendBatteryStatus() {
-    if (!isConnected) return;
-    int level = getBatteryPercentage();
-    batteryLow = (level <= BATTERY_LOW_THRESHOLD);
-
-    StaticJsonDocument<256> txDoc;
-    JsonArray arr = txDoc.to<JsonArray>();
-    arr.add("device_battery");
-    JsonObject p = arr.createNestedObject();
-    
-    portENTER_CRITICAL(&idMux);
-    p["deviceId"] = device_id;
-    portEXIT_CRITICAL(&idMux);
-    
-    p["batteryLevel"] = level;
-
-    String msg;
-    serializeJson(txDoc, msg);
-    socketIO.sendEVENT(msg);
-    Serial.printf("[BATERÍA] Capacidad: %d%%\n", level);
-}
-
-// ============================================================
-// RECEPCIÓN DE PROTOCOLO TALLY ARBITER
-// ============================================================
-void processBusOptions(JsonArray arr) {
-    busMapCount = 0;
-    for (JsonObject bus : arr) {
-        if (busMapCount >= 16) break;
+  server.on("/scan", HTTP_GET, []() {
+    int n = WiFi.scanNetworks();
+    String json = "[";
+    if (n > 0) {
+      for (int i = 0; i < n; ++i) {
+        if(WiFi.SSID(i).length() == 0) continue;
+        int rssi = WiFi.RSSI(i);
+        int quality = 2 * (rssi + 100);
+        if(rssi <= -100) quality = 0;
+        else if(rssi >= -50) quality = 100;
         
-        const char* b_id = bus["id"].as<const char*>();
-        const char* b_ty = bus["type"].as<const char*>();
-        
-        strlcpy(busMap[busMapCount].id,   b_id ? b_id : "", sizeof(busMap[busMapCount].id));
-        strlcpy(busMap[busMapCount].type, b_ty ? b_ty : "", sizeof(busMap[busMapCount].type));
-        busMapCount++;
+        json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + String(quality) + "}";
+        if (i < n - 1) json += ",";
+      }
+      if(json.endsWith(",")) json.remove(json.length() - 1);
     }
-    Serial.printf("[TA] Configuración de buses: %d mapeados.\n", busMapCount);
+    json += "]";
+    server.send(200, "application/json", json);
+    WiFi.scanDelete(); 
+  });
+
+  server.on("/save", HTTP_POST, []() {
+    if (server.hasArg("ssid")) wifi_ssid = server.arg("ssid");
+    if (server.hasArg("pass")) wifi_pass = server.arg("pass");
+    if (server.hasArg("host")) tallyarbiter_host = server.arg("host");
+    if (server.hasArg("port")) tallyarbiter_port = server.arg("port").toInt();
+    if (server.hasArg("deviceid")) TALLY_DEVICE_ID = server.arg("deviceid");
+
+    preferences.begin("tally-arbiter", false);
+    preferences.putString("ssid", wifi_ssid);
+    preferences.putString("pass", wifi_pass);
+    preferences.putString("host", tallyarbiter_host);
+    preferences.putInt("port", tallyarbiter_port);
+    preferences.putString("deviceid", TALLY_DEVICE_ID);
+    preferences.end();
+
+    server.send(200, "text/plain", "OK");
+    delay(1000);
+    ESP.restart(); 
+  });
+
+  server.on("/gotsleep", HTTP_GET, []() {
+    server.send(200, "text/plain", "OK");
+    delay(500); 
+    apagarTallyPorSoftware(); 
+  });
+
+  server.on("/gotreset", HTTP_GET, []() {
+    server.send(200, "text/plain", "OK");
+    delay(500);
+    iniciarModoAP();
+  });
+
+  server.begin();
 }
 
-void processDeviceStates(JsonArray arr) {
-    isTallyProgram = false;
-    isTallyPreview  = false;
-    for (JsonObject state : arr) {
-        JsonArray sources = state["sources"].as<JsonArray>();
-        if (sources.isNull() || sources.size() == 0) continue;
-
-        const char* t = getBusTypeById(state["busId"] | "");
-        if (strcmp(t, "program") == 0) isTallyProgram = true;
-        if (strcmp(t, "preview") == 0) isTallyPreview  = true;
-    }
-    if (isTallyProgram != lastProgramState || isTallyPreview != lastPreviewState) {
-        Serial.printf("[TALLY] Program: %d | Preview: %d\n", isTallyProgram, isTallyPreview);
-        lastProgramState = isTallyProgram;
-        lastPreviewState = isTallyPreview;
-    }
-}
-
-// ============================================================
-// MANEJADOR DE EVENTOS DE SOCKET SÍNCRONOS
-// ============================================================
-void socketIOEvent(socketIOmessageType_t type, uint8_t* payload, size_t length) {
-    lastSocketAliveTime = millis(); 
-
-    switch (type) {
-        case sIOtype_DISCONNECT:
-            isConnected = false; isTallyProgram = false; isTallyPreview = false;
-            currentAnim = ANIM_NONE;
-            Serial.println("[SIO] Desconectado del servidor principal.");
-            break;
-
-        case sIOtype_CONNECT:
-            shutdownConfigPortal();
-            isConnected = true; everConnectedThisBoot = true;
-            startAnim(ANIM_CONN_SUCCESS);
-            // FIX: eliminado el socketIO.send(sIOtype_CONNECT,"/") manual. La librería ya
-            // negocia el namespace ANTES de disparar este evento; reenviarlo era redundante.
-            // Orden correcto: primero registrar el listener, después pedir el mapa de buses.
-            sendListenerConnect();
-            ws_emit("bus_options");
-            sendBatteryStatus();
-            Serial.println("[SIO] Enlace Socket.IO operacional.");
-            break;
-
-        case sIOtype_EVENT: {
-            if (isOtaUpdating) break; 
-            
-            // Guard Clause defensivo contra desbordamiento masivo
-            if (length > 4096) {
-                Serial.printf("[SIO] Descarte defensivo: Payload excesivo de %d bytes.\n", length);
-                break;
-            }
-            
-            doc.clear(); 
-            DeserializationError err = deserializeJson(doc, payload, length);
-            if (err) break;
-
-            const char* event = doc[0] | "";
-
-            if (strcmp(event, "bus_options") == 0) {
-                processBusOptions(doc[1].as<JsonArray>());
-            }
-            else if (strcmp(event, "device_states") == 0) {
-                processDeviceStates(doc[1].as<JsonArray>());
-            }
-            else if (strcmp(event, "flash") == 0) {
-                startAnim(ANIM_FLASH);
-            }
-            else if (strcmp(event, "reassign") == 0) {
-                String oldIdStr = doc[1]["oldDeviceId"] | "";
-                String newIdStr = doc[1]["newDeviceId"] | "";
-                
-                portENTER_CRITICAL(&idMux);
-                bool idMatch = (oldIdStr == device_id);
-                portEXIT_CRITICAL(&idMux);
-
-                if (idMatch && newIdStr.length() > 0) {
-                    portENTER_CRITICAL(&idMux);
-                    strlcpy(device_id, newIdStr.c_str(), sizeof(device_id)); 
-                    portEXIT_CRITICAL(&idMux);
-                    
-                    saveConfig(ta_host, device_id, ta_port);
-
-                    doc.clear();
-                    JsonArray ack = doc.to<JsonArray>();
-                    ack.add("listener_reassign_object");
-                    JsonObject o = ack.createNestedObject();
-                    o["oldDeviceId"] = oldIdStr;
-                    o["newDeviceId"] = newIdStr;
-                    String ackMsg;
-                    serializeJson(doc, ackMsg);
-                    socketIO.sendEVENT(ackMsg);
-
-                    sendListenerConnect();
-                }
-            }
-            else if (strcmp(event, "deviceId") == 0) {
-                const char* newId = doc[1] | "";
-                if (strlen(newId) > 0 && strlen(newId) < sizeof(device_id)) {
-                    portENTER_CRITICAL(&idMux);
-                    strlcpy(device_id, newId, sizeof(device_id)); 
-                    portEXIT_CRITICAL(&idMux);
-                    
-                    saveConfig(ta_host, device_id, ta_port);
-                    sendListenerConnect();
-                }
-            }
-            break;
-        }
-        default:
-            break;
-    }
-}
-
-// ============================================================
-// ENTRADAS DIGITALES (BOTÓN BOOT)
-// ============================================================
-void handleButton() {
-    bool pressed = (digitalRead(PIN_BOOT_BTN) == LOW);
-    if (pressed && !btnHeld)  { btnHeld = true; btnPressStart = millis(); }
-    if (!pressed && btnHeld) {
-        unsigned long held = millis() - btnPressStart;
-        btnHeld = false;
-        if (held < BTN_DEBOUNCE_MS) return;
-        if (held >= BTN_FORCE_PORTAL_MS) {
-            resetConfig(); wm.resetSettings(); delay(500); ESP.restart();
-        } else if (held >= BTN_SHUTDOWN_MS) {
-            enterShutdown();
-        }
-    }
-}
-
-// ============================================================
-// INITIALIZATION
-// ============================================================
 void setup() {
-    Serial.begin(115200);
+  Serial.begin(115200);
+  
+  pinMode(PIN_PROGRAM, OUTPUT);
+  pinMode(PIN_PREVIEW, OUTPUT);
+  pinMode(PIN_STATUS, OUTPUT); 
+  
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); 
+  
+  pinMode(35, INPUT);
+  analogSetAttenuation(ADC_11db); 
+  
+  digitalWrite(PIN_PROGRAM, LOW);
+  digitalWrite(PIN_PREVIEW, LOW);
+  
+  iniciarParpadeo(0.2); 
+
+  setCpuFrequencyMhz(160); 
+
+  preferences.begin("tally-arbiter", false);
+  tallyarbiter_host = preferences.getString("host", "192.168.10.107");
+  tallyarbiter_port = preferences.getInt("port", 4455);
+  TALLY_DEVICE_ID = preferences.getString("deviceid", "0e59aba8");
+  wifi_ssid = preferences.getString("ssid", "");
+  wifi_pass = preferences.getString("pass", "");
+  if(preferences.getString("devicename").length() > 0){
+    DeviceName = preferences.getString("devicename");
+  }
+  preferences.end();
+
+  DeviceId = TALLY_DEVICE_ID;
+
+  if (wifi_ssid.length() > 0) {
+    Serial.println("[TALLY] Intentando conectar a: " + wifi_ssid);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
     
-    // Purga de memoria Bluetooth para anexar 51KB dinámicos reales al Heap
-    esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println();
+  }
 
-    pinMode(PIN_PROGRAM,  OUTPUT);
-    pinMode(PIN_PREVIEW,  OUTPUT);
-    pinMode(PIN_BAT_LED,  OUTPUT);
-    pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
-    digitalWrite(PIN_PROGRAM, LOW);
-    digitalWrite(PIN_PREVIEW, LOW);
-    digitalWrite(PIN_BAT_LED, LOW);
-
-    initADC();
-    loadConfig();
-    snprintf(portStr, sizeof(portStr), "%d", ta_port);
-
-    // FIX: los WiFiManagerParameter se construyen (globales) ANTES de loadConfig(), así que
-    // mostraban los valores por defecto del .ino y no los guardados en NVS. Los refrescamos
-    // aquí para que el portal muestre el host/devId/puerto que realmente están en uso.
-    param_host.setValue(ta_host, sizeof(ta_host));
-    param_devid.setValue(device_id, sizeof(device_id));
-    param_port.setValue(portStr, 6);
-
-    wm.setConfigPortalBlocking(false);
-    wm.setConfigPortalTimeout(180);
-    wm.setSaveParamsCallback(saveParamsCallback);
-    wm.setTitle("Tally Arbiter ESP32");
-    wm.addParameter(&param_host);
-    wm.addParameter(&param_devid);
-    wm.addParameter(&param_port);
-    wm.autoConnect("TallyConfig");
-
-    // Limita la potencia Tx a 15dBm para suprimir armónicos RF sobre el ADC de la batería
-    WiFi.setTxPower(WIFI_POWER_15dBm);
-    
-    lastWiFiAliveTime   = millis();
-    lastSocketAliveTime = millis();
-
-    // Configuración limpia de la máquina de estados de ArduinoOTA
-    ArduinoOTA.setHostname("tally-esp32");
-    
-    ArduinoOTA.onStart([]() {
-        isOtaUpdating = true;
-        socketIO.disconnect(); // Cierre del socket de aplicación; lwIP permanece abierto para binario
-        digitalWrite(PIN_PROGRAM, HIGH);
-        digitalWrite(PIN_PREVIEW, HIGH);
-        Serial.println("[OTA] Socket de aplicación cerrado de forma limpia. Descargando firmware...");
-    });
-
-    ArduinoOTA.onError([](ota_error_t error) {
-        isOtaUpdating = false;
-        digitalWrite(PIN_PROGRAM, LOW);
-        digitalWrite(PIN_PREVIEW, LOW);
-        Serial.printf("[OTA] Error de transmisión [%u]. Reanudando loop secundario de control...\n", error);
-    });
-    
-    ArduinoOTA.begin();
-
-    socketIO.begin(ta_host, ta_port);
-    socketIO.onEvent(socketIOEvent);
-    socketIO.setReconnectInterval(5000);
-
-    Serial.printf("[SYSTEM] Kernel v3.6.0 desplegado con éxito.\n");
+  if (WiFi.status() != WL_CONNECTED) {
+    iniciarModoAP();
+  } else {
+    Serial.println("[TALLY] Conectado exitosamente. IP: " + WiFi.localIP().toString());
+    networkConnected = true;
+    lastWiFiConnectedTime = millis();
+    if (MDNS.begin("configurar-tally1")) {
+      MDNS.addService("http", "tcp", 80);
+    }
+    setupWebServer();
+    connectToServer();
+  }
 }
 
-// ============================================================
-// BUCLE PRINCIPAL (ARQUITECTURA DE TRES CAPAS DEFENSIVAS)
-// ============================================================
 void loop() {
-    // Capa 0: Bloqueo de infraestructura por actualización OTA activa
-    if (isOtaUpdating) {
-        ArduinoOTA.handle();
-        return; 
+  server.handleClient();
+
+  if (!isAPMode) {
+    if (WiFi.status() == WL_CONNECTED) {
+      socket.loop();
+    } else {
+      if (millis() - lastWiFiConnectedTime >= 30000) {
+        iniciarModoAP();
+      }
     }
 
-    unsigned long now = millis();
-
-    // Desplazamiento fuera de hilo del reinicio diferido solicitado por el Portal
-    if (pendingRestart && (now - restartTimer >= 1500)) {
-        ESP.restart();
+    static unsigned long lastBatteryCheck = 0;
+    if (millis() - lastBatteryCheck >= 15000) {
+      lastBatteryCheck = millis();
+      int bateriaActual = getBatteryPercentage();
+      if (!noMeasurementHardware && !isCharging && bateriaActual <= 12) {
+        if (!lowBatteryAlert) { lowBatteryAlert = true; iniciarParpadeo(2.0); }
+      } else {
+        if (lowBatteryAlert) { lowBatteryAlert = false; if (socketConnected) apagarLED(); else iniciarParpadeo(0.2); }
+      }
     }
-
-    handleButton();
-    wm.process();
-
-    if (wm.getConfigPortalActive()) {
-        lastWiFiAliveTime = now;
-        lastSocketAliveTime = now;
-    }
-
-    // --- CAPA 1: AUDITORÍA DE ENLACE E INFRAESTRUCTURA WI-FI (CON BACKOFF EXPONENCIAL) ---
-    if (WiFi.status() != WL_CONNECTED) {
-        if (isConnected) { isConnected = false; isTallyProgram = false; isTallyPreview = false; }
-        
-        if (now - lastReconnectAttempt >= currentReconnectInterval) {
-            lastReconnectAttempt = now;
-            wifiRetryCount++;
-            
-            Serial.printf("[WIFI] Desconectado. Intento #%d. Reintento en %lu ms...\n", wifiRetryCount, currentReconnectInterval);
-            
-            // Duplicar intervalo para el siguiente intento (Límite: 60 segundos)
-            currentReconnectInterval = min(currentReconnectInterval * 2, 60000UL);
-            
-            // Hard Reset de la capa de radio física si lwIP está severamente degradado
-            if (wifiRetryCount >= 6) {
-                Serial.println("[WIFI] Stack inestable persistente. Reiniciando PHY + lwIP...");
-                
-                socketIO.disconnect();
-                WiFi.disconnect(false, false); 
-                delay(100);
-                
-                esp_wifi_stop();
-                delay(300);
-                esp_wifi_start();
-                delay(200);
-                
-                WiFi.mode(WIFI_STA);
-                WiFi.begin(); 
-                wifiRetryCount = 0;
-                currentReconnectInterval = BASE_RECONNECT_INTERVAL; // Reset del backoff
-            } else {
-                WiFi.reconnect();
-            }
-        }
-        updateLEDs();
-
-        if (!everConnectedThisBoot && (now - lastWiFiAliveTime >= INITIAL_CONN_TIMEOUT_MS)) enterDeepSleep();
-        if (everConnectedThisBoot && (now - lastWiFiAliveTime >= DEEP_SLEEP_TIMEOUT_MS)) enterDeepSleep();
-        return;
-    }
-
-    // Infraestructura saludable: Reseteo de contadores reactivos y del intervalo base
-    lastWiFiAliveTime = now;
-    wifiRetryCount = 0;
-    currentReconnectInterval = BASE_RECONNECT_INTERVAL;
-
-    // --- CAPA 2: PROCESAMIENTO Y AGENTES SECUNDARIOS SÍNCRONOS ---
-    socketIO.loop();
-    ArduinoOTA.handle();
-    updateLEDs();
-
-    if (now - lastBatteryCheck >= BATTERY_INTERVAL_MS) { 
-        lastBatteryCheck = now; 
-        sendBatteryStatus(); 
-    }
-
-    // --- CAPA 3: WATCHDOG DE APLICACIÓN (MITIGACIÓN CONTRA TCP HALF-OPEN / CAPA 7) ---
-    if (isConnected && (now - lastSocketAliveTime >= LINK_WATCHDOG_TIMEOUT_MS)) {
-        Serial.println("[WATCHDOG] Servidor silencioso. Forzando desconexión lógica rápida...");
-        isConnected = false; isTallyProgram = false; isTallyPreview = false;
-        lastSocketAliveTime = now; // Margen de gracia para reenganche sin causar deep sleep prematuro
-        socketIO.disconnect();
-    }
-
-    // Ahorro de energía si el AP responde pero la instancia de Tally Arbiter desaparece de la red
-    unsigned long timeout = everConnectedThisBoot ? DEEP_SLEEP_TIMEOUT_MS : INITIAL_CONN_TIMEOUT_MS;
-    if (!isConnected && (now - lastSocketAliveTime >= timeout)) enterDeepSleep();
+  }
 }
