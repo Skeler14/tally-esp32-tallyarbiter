@@ -6,34 +6,31 @@
 #include <Arduino_JSON.h>
 #include <Preferences.h>
 #include <Ticker.h>
+#include <esp_wifi.h> // Librería nativa para controlar la potencia de la radio
 
 /* VARIABLES DE CONFIGURACIÓN DEL USUARIO */
-bool CUT_BUS = true; // true = Program + Preview = Tally Rojo; false = Program + Preview = Tally Amarillo
+bool CUT_BUS = true; 
 
-// Parámetros dinámicos del Tally
 String tallyarbiter_host;
 int tallyarbiter_port;
 String TALLY_DEVICE_ID;
 String wifi_ssid = "";
 String wifi_pass = "";
 
-/* ASIGNACIÓN DE PINES FÍSICOS */
-const int PIN_PROGRAM = 25;  // LED Rojo
-const int PIN_PREVIEW = 26;  // LED Verde
-const int PIN_STATUS = 33;   // LED Azul de Estado
+const int PIN_PROGRAM = 25;  
+const int PIN_PREVIEW = 26;  
+const int PIN_STATUS = 33;   
 
-/* VARIABLES GLOBALES DE DIAGNÓSTICO DE ENERGÍA */
 int adcRawValue = 0;
 int detectedPin = 35;
 bool noMeasurementHardware = false;
 bool isCharging = false;
+int ultimoPorcentajeBateria = -1; 
 
-/* CONTROL DE TIEMPOS Y ESTADOS */
 unsigned long lastWiFiConnectedTime = 0;
 int lastTallyState = -1; 
 bool isAPMode = false;
 
-// Estados de control de alertas
 bool socketConnected = false;
 bool lowBatteryAlert = false;
 
@@ -53,7 +50,6 @@ bool mode_preview = false;
 bool mode_program = false;
 bool networkConnected = false;
 
-// --- DECLARACIÓN O FUNCIONES EN ORDEN CRÍTICO ---
 void ws_emit(String event, String payload = "") {
   String msg = (payload != "") ? "[\"" + event + "\"," + payload + "]" : "[\"" + event + "\"]";
   socket.sendEVENT(msg);
@@ -75,26 +71,54 @@ void apagarLED() {
 
 int getBatteryPercentage() {
   long sum = 0;
-  for (int i = 0; i < 10; i++) {
+  for (int i = 0; i < 5; i++) {
     sum += analogRead(35);
-    delay(2);
   }
-  adcRawValue = sum / 10;
+  adcRawValue = sum / 5;
   if (adcRawValue < 500) {
     noMeasurementHardware = true;
     isCharging = false;
+    ultimoPorcentajeBateria = -1;
     return -1;
   }
   noMeasurementHardware = false;
   if (adcRawValue >= 2320) {
     isCharging = true;
     int percentage = map(adcRawValue, 2320, 2450, 85, 100);
-    return constrain(percentage, 0, 100);
+    ultimoPorcentajeBateria = constrain(percentage, 0, 100);
+    return ultimoPorcentajeBateria;
   } else {
     isCharging = false;
     int percentage = map(adcRawValue, 1900, 2310, 0, 100);
-    return constrain(percentage, 0, 100);
+    ultimoPorcentajeBateria = constrain(percentage, 0, 100);
+    return ultimoPorcentajeBateria;
   }
+}
+
+String generarHtmlBateria() {
+  if (ultimoPorcentajeBateria == -1 && !noMeasurementHardware && !isCharging) {
+    return "<div id='batBox' style='background: #1e293b; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #334155;'>"
+           "  <span style='color: #94a3b8; font-weight: 600; font-size: 16px;'>🔋 Batería: Sin consultar</span>"
+           "</div>";
+  }
+  if (noMeasurementHardware) {
+    return "<div id='batBox' style='background: #2a1b1f; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #4a2328;'>"
+           "  <span style='color: #f87171; font-weight: 600; font-size: 15px;'>🔋 Alimentación: Activa (Modo Seguro)</span>"
+           "</div>";
+  }
+  if (isCharging) {
+    return "<div id='batBox' style='background: #112240; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #1d3557;'>"
+           "  <span style='color: #64ffda; font-weight: 600; font-size: 16px;'>⚡ Alimentación: USB / Cargando (" + String(ultimoPorcentajeBateria) + "%)</span>"
+           "</div>";
+  }
+  
+  String color = "#10b981"; 
+  if (ultimoPorcentajeBateria <= 10) color = "#ef4444";
+  else if (ultimoPorcentajeBateria <= 25) color = "#f59e0b";
+
+  return "<div id='batBox' style='background: #1e293b; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #334155;'>"
+         "  <span style='color: " + color + "; font-weight: 600; font-size: 16px;'>🔋 Batería: " + String(ultimoPorcentajeBateria) + "%</span>"
+         "</div>";
 }
 
 void evaluateMode() {
@@ -109,14 +133,15 @@ void evaluateMode() {
   if (currentState == 1) { digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, HIGH); }
   else if (currentState == 2) { digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); }
   else if (currentState == 3) {
-    if (CUT_BUS == true) { digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); }
+    if (CUT_BUS) { digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); }
     else { digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, HIGH); }
   }
   else { digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, LOW); }
 }
 
 void SetDeviceName() {
-  for (int i = 0; i < Devices.length(); i++) {
+  int len = Devices.length();
+  for (int i = 0; i < len; i++) {
     if (JSON.stringify(Devices[i]["id"]) == "\"" + DeviceId + "\"") {
       String strDevice = JSON.stringify(Devices[i]["name"]);
       DeviceName = strDevice.substring(1, strDevice.length() - 1);
@@ -129,29 +154,39 @@ void SetDeviceName() {
   evaluateMode();
 }
 
-String getBusTypeById(String busId) {
-  for (int i = 0; i < BusOptions.length(); i++) {
-    if (JSON.stringify(BusOptions[i]["id"]) == busId) return JSON.stringify(BusOptions[i]["type"]);
-  }
-  return "invalid";
-}
-
 void processTallyData() {
   String targetDeviceQuote = "\"" + DeviceId + "\""; 
-  for (int i = 0; i < DeviceStates.length(); i++) {
+  int statesLen = DeviceStates.length();
+  int busLen = BusOptions.length();
+  
+  bool new_preview = false;
+  bool new_program = false;
+
+  for (int i = 0; i < statesLen; i++) {
     if (JSON.stringify(DeviceStates[i]["deviceId"]) != targetDeviceQuote) continue;
+    
     String busIdStr = JSON.stringify(DeviceStates[i]["busId"]);
-    String busType = getBusTypeById(busIdStr);
-    if (busType == "\"preview\"") mode_preview = (DeviceStates[i]["sources"].length() > 0);
-    if (busType == "\"program\"") mode_program = (DeviceStates[i]["sources"].length() > 0);
+    bool sourcesActive = (DeviceStates[i]["sources"].length() > 0);
+    
+    for (int j = 0; j < busLen; j++) {
+      if (JSON.stringify(BusOptions[j]["id"]) == busIdStr) {
+        String busType = JSON.stringify(BusOptions[j]["type"]);
+        if (busType == "\"preview\"") new_preview = sourcesActive;
+        else if (busType == "\"program\"") new_program = sourcesActive;
+        break; 
+      }
+    }
   }
+
+  mode_preview = new_preview;
+  mode_program = new_program;
   evaluateMode();
 }
 
 void socket_Flash() {
   for(int i = 0; i < 4; i++) {
-    digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); delay(100);
-    digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, HIGH); delay(100);
+    digitalWrite(PIN_PROGRAM, HIGH); digitalWrite(PIN_PREVIEW, LOW); delay(80);
+    digitalWrite(PIN_PROGRAM, LOW); digitalWrite(PIN_PREVIEW, HIGH); delay(80);
   }
   digitalWrite(PIN_PREVIEW, LOW); lastTallyState = -1; evaluateMode();
 }
@@ -170,15 +205,24 @@ void socket_event(socketIOmessageType_t type, uint8_t * payload, size_t length) 
       break;
     case sIOtype_EVENT: {
       String msg = (char*)payload;
-      String typeStr = msg.substring(2, msg.indexOf("\"", 2));
-      String content = msg.substring(typeStr.length() + 4);
-      content.remove(content.length() - 1);
+      int firstQuote = msg.indexOf("\"");
+      if (firstQuote == -1) return;
+      int secondQuote = msg.indexOf("\"", firstQuote + 1);
+      if (secondQuote == -1) return;
+      
+      String typeStr = msg.substring(firstQuote + 1, secondQuote);
+      String content = msg.substring(secondQuote + 2);
+      if(content.endsWith("]")) content.remove(content.length() - 1);
 
-      if (typeStr == "bus_options") BusOptions = JSON.parse(content);
-      if (typeStr == "flash") socket_Flash();
-      if (typeStr == "deviceId") { DeviceId = content.substring(1, content.length()-1); SetDeviceName(); }
-      if (typeStr == "devices") { Devices = JSON.parse(content); SetDeviceName(); }
       if (typeStr == "device_states") { DeviceStates = JSON.parse(content); processTallyData(); }
+      else if (typeStr == "devices") { Devices = JSON.parse(content); SetDeviceName(); }
+      if (typeStr == "bus_options") { BusOptions = JSON.parse(content); }
+      else if (typeStr == "flash") { socket_Flash(); }
+      else if (typeStr == "deviceId") { 
+        if(content.startsWith("\"") && content.endsWith("\"")) DeviceId = content.substring(1, content.length()-1);
+        else DeviceId = content;
+        SetDeviceName(); 
+      }
       break;
     }
     default: break;
@@ -214,7 +258,6 @@ void iniciarModoAP() {
   lastTallyState = 0;
 
   iniciarParpadeo(0.1); 
-  
   WiFi.disconnect();
   WiFi.mode(WIFI_AP_STA); 
   
@@ -224,34 +267,18 @@ void iniciarModoAP() {
   WiFi.softAPConfig(local_IP, gateway, subnet);
   
   WiFi.softAP("Config-Tally-AP");
-  Serial.println("[TALLY] Modo AP iniciado. Entra a http://192.168.4.1");
-  
   setupWebServer();
 }
 
 void setupWebServer() {
   server.on("/", HTTP_GET, []() {
-    int bat = getBatteryPercentage();
     String batHtml = "";
-    
     if (isAPMode) {
       batHtml = "<div style='background: #0284c7; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #0369a1;'> "
                 "  <span style='color: #ffffff; font-weight: 600; font-size: 15px;'>📡 Modo Configuración AP Activo</span>"
-                "  <div style='font-size: 12px; color: #e0f2fe; margin-top: 6px;'>Introduce los datos abajo para conectar el Tally a tu red.</div>"
-                "</div>";
-    } else if (noMeasurementHardware) {
-      batHtml = "<div style='background: #2a1b1f; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #4a2328;'>"
-                "  <span style='color: #f87171; font-weight: 600; font-size: 15px;'>🔋 Alimentación: Activa (Modo Seguro)</span>"
-                "</div>";
-    } else if (isCharging) {
-      batHtml = "<div style='background: #112240; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #1d3557;'>"
-                "  <span style='color: #64ffda; font-weight: 600; font-size: 16px;'>⚡ Alimentación: USB / Cargando</span>"
                 "</div>";
     } else {
-      String color = "#10b981"; if (bat <= 15) color = "#ef4444";
-      batHtml = "<div style='background: #1e293b; padding: 14px; border-radius: 8px; text-align: center; margin-bottom: 24px; border: 1px solid #334155;'>"
-                "  <span style='color: " + color + "; font-weight: 600; font-size: 16px;'>🔋 Batería: " + String(bat) + "%</span>"
-                "</div>";
+      batHtml = generarHtmlBateria();
     }
 
     String html = R"html(
@@ -274,14 +301,17 @@ void setupWebServer() {
     .toggle-pass { position: absolute; right: 12px; cursor: pointer; color: #94a3b8; user-select: none; font-size: 14px; font-weight: bold; }
     input[type='submit'] { width: 100%; padding: 14px; background-color: #10b981; color: #ffffff; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 10px; }
     input[type='submit']:hover { background-color: #059669; }
-    .btn-zone { display: flex; gap: 10px; margin-top: 15px; }
+    
+    .btn-zone { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; }
+    .btn-row { display: flex; gap: 10px; }
     .btn-action { flex: 1; padding: 12px; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; color: white; text-align: center; text-decoration: none; user-select: none; }
     .btn-sleep { background-color: #dc2626; }
     .btn-sleep:hover { background-color: #b91c1c; }
     .btn-wifi { background-color: #0284c7; }
     .btn-wifi:hover { background-color: #0369a1; }
+    .btn-check-bat { background-color: #475569; border: 1px solid #64748b; width: 100%; padding: 11px; margin-bottom: 15px; font-size: 13px; }
+    .btn-check-bat:hover { background-color: #64748b; }
     
-    /* MODAL DE ESCANEO */
     .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(15,17,26,0.85); align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }
     .modal-content { background-color: #1a1d29; border: 1px solid #334155; border-radius: 16px; width: 100%; max-width: 380px; padding: 24px; box-sizing: border-box; box-shadow: 0 20px 40px rgba(0,0,0,0.6); }
     .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
@@ -294,7 +324,6 @@ void setupWebServer() {
     .wifi-item:hover { background-color: #24283b; color: #64ffda; }
     .loading-text { text-align: center; padding: 20px; color: #94a3b8; font-size: 14px; }
 
-    /* PANTALLA GENERAL DE ACCIÓN / CARGA (LOADING OVERLAY) */
     .loader-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: #0f111a; z-index: 9999; flex-direction: column; align-items: center; justify-content: center; color: white; }
     .spinner { border: 4px solid rgba(255, 255, 255, 0.1); width: 50px; height: 50px; border-radius: 50%; border-left-color: #3b82f6; animation: spin 1s linear infinite; margin-bottom: 20px; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
@@ -312,14 +341,14 @@ void setupWebServer() {
     function abrirBuscadorWiFi() {
       document.getElementById("wifiModal").style.display = "flex";
       var lista = document.getElementById("lista_redes");
-      lista.innerHTML = "<div class='loading-text'>⏳ Escaneando redes cercanas...<br><span style='font-size:11px;color:#64748b;'>Esto tomará unos 3 segundos</span></div>";
+      lista.innerHTML = "<div class='loading-text'>⏳ Escaneando redes cercanas...</div>";
       
       fetch("/scan")
         .then(response => response.json())
         .then(data => {
           lista.innerHTML = "";
           if(data.length == 0) {
-            lista.innerHTML = "<div class='loading-text' style='color:#ef4444;'>No se encontraron redes de 2.4GHz.</div>";
+            lista.innerHTML = "<div class='loading-text' style='color:#ef4444;'>No se encontraron redes.</div>";
             return;
           }
           data.forEach(function(red) {
@@ -332,15 +361,10 @@ void setupWebServer() {
             };
             lista.appendChild(div);
           });
-        })
-        .catch(err => {
-          lista.innerHTML = "<div class='loading-text' style='color:#ef4444;'>Error al conectar con la placa.</div>";
         });
     }
 
-    function cerrarModal() {
-      document.getElementById("wifiModal").style.display = "none";
-    }
+    function cerrarModal() { document.getElementById("wifiModal").style.display = "none"; }
 
     function mostrarCargando(titulo, subtitulo) {
       document.getElementById("loader_title").innerText = titulo;
@@ -350,38 +374,52 @@ void setupWebServer() {
 
     function enviarComandoSegundoPlano(ruta, titulo, subtitulo) {
       mostrarCargando(titulo, subtitulo);
-      fetch(ruta)
-        .then(res => console.log("Comando enviado."))
-        .catch(err => console.log("Reinicio procesado correctamente."));
+      fetch(ruta).catch(err => console.log("OK"));
     }
 
-    // NUEVO PARA MÓVILES: Captura los datos y los envía asíncronamente sin romper el HTML móvil
     function guardarConfiguracion(event) {
-      event.preventDefault(); // Detiene por completo la redirección del navegador móvil
-      
-      mostrarCargando('Guardando Datos', 'El Tally se está reiniciando para conectar al nuevo WiFi...');
-      
+      event.preventDefault(); 
+      mostrarCargando('Guardando Datos', 'El Tally se está reiniciando...');
       var formData = new FormData(document.getElementById("configForm"));
-      
-      fetch("/save", {
-        method: "POST",
-        body: formData
-      })
-      .then(res => console.log("Configuración enviada."))
-      .catch(err => console.log("La placa se está reiniciando de forma segura."));
+      fetch("/save", { method: "POST", body: formData }).catch(err => console.log("Reset OK"));
+    }
+
+    function consultarBateriaManual() {
+      var btn = document.getElementById("btnBat");
+      var originalText = btn.innerText;
+      btn.innerText = "⏳ Midiendo voltaje...";
+      btn.disabled = true;
+
+      fetch("/getbat")
+        .then(response => response.text())
+        .then(htmlBloque => {
+          document.getElementById("batContainer").innerHTML = htmlBloque;
+          btn.innerText = originalText;
+          btn.disabled = false;
+        })
+        .catch(err => {
+          btn.innerText = "❌ Error al medir";
+          btn.disabled = false;
+        });
     }
   </script>
 </head>
 <body>
   <div class='card'>
     <h2>Configuración Tally</h2>
-    %BATTERY_SECTION%
+    
+    <div id="batContainer">
+      %BATTERY_SECTION%
+    </div>
+
+    %BUTTON_CHECK_BAT%
+
     <form id='configForm' onsubmit='guardarConfiguracion(event)'>
       <div class='form-group'>
         <label>Nombre de tu red WiFi (SSID):</label>
         <div class='input-btn-container'>
-          <input type='text' id='wifi_ssid_input' name='ssid' value='%WIFI_SSID%' placeholder='Ej: MiRedHome_2.4G'>
-          <button type='button' class='btn-inline' onclick='abrirBuscadorWiFi()' title='Buscar redes cercanas'>🔍</button>
+          <input type='text' id='wifi_ssid_input' name='ssid' value='%WIFI_SSID%'>
+          <button type='button' class='btn-inline' onclick='abrirBuscadorWiFi()'>🔍</button>
         </div>
       </div>
       <div class='form-group'>
@@ -424,7 +462,6 @@ void setupWebServer() {
     <div id="loader_title" class="loader-title">Procesando...</div>
     <div id="loader_subtitle" class="loader-subtitle">Por favor espera un momento.</div>
   </div>
-
 </body>
 </html>
 )html";
@@ -436,18 +473,29 @@ void setupWebServer() {
     html.replace("%TALLY_PORT%", String(tallyarbiter_port));
     html.replace("%TALLY_DEVICE_ID%", TALLY_DEVICE_ID);
 
-    String extraButtons = "";
     if (!isAPMode) {
-      extraButtons = R"html(
+      html.replace("%BUTTON_CHECK_BAT%", "<button id='btnBat' class='btn-action btn-check-bat' onclick='consultarBateriaManual()'>Ver nivel de batería (Dar para actualizar)</button>");
+      
+      String extraButtons = R"html(
       <div class='btn-zone'>
-        <button class='btn-action btn-sleep' onclick="enviarComandoSegundoPlano('/gotsleep', '🔴 Apagando Tally', 'El dispositivo está entrando en modo de reposo profundo seguro.')">🔴 Apagar Tally</button>
-        <button class='btn-action btn-wifi' onclick="enviarComandoSegundoPlano('/gotreset', '🔄 Abriendo Modo AP', 'Desconectando de la red actual y levantando portal local en http://192.168.4.1')">🔄 Resetear WiFi</button>
+        <div class='btn-row'>
+          <button class='btn-action btn-sleep' onclick="enviarComandoSegundoPlano('/gotsleep', '🔴 Apagando Tally', 'Entrando en modo de reposo...')">🔴 Apagar Tally</button>
+          <button class='btn-action btn-wifi' onclick="enviarComandoSegundoPlano('/gotreset', '🔄 Abriendo Modo AP', 'Levantando portal local...')">🔄 Resetear WiFi</button>
+        </div>
       </div>
       )html";
+      html.replace("%EXTRA_BUTTONS%", extraButtons);
+    } else {
+      html.replace("%BUTTON_CHECK_BAT%", "");
+      html.replace("%EXTRA_BUTTONS%", "");
     }
-    html.replace("%EXTRA_BUTTONS%", extraButtons);
 
     server.send(200, "text/html", html);
+  });
+
+  server.on("/getbat", HTTP_GET, []() {
+    getBatteryPercentage(); 
+    server.send(200, "text/html", generarHtmlBateria());
   });
 
   server.on("/scan", HTTP_GET, []() {
@@ -487,19 +535,19 @@ void setupWebServer() {
     preferences.end();
 
     server.send(200, "text/plain", "OK");
-    delay(1000);
+    delay(500);
     ESP.restart(); 
   });
 
   server.on("/gotsleep", HTTP_GET, []() {
     server.send(200, "text/plain", "OK");
-    delay(500); 
+    delay(200); 
     apagarTallyPorSoftware(); 
   });
 
   server.on("/gotreset", HTTP_GET, []() {
     server.send(200, "text/plain", "OK");
-    delay(500);
+    delay(200);
     iniciarModoAP();
   });
 
@@ -522,8 +570,7 @@ void setup() {
   digitalWrite(PIN_PREVIEW, LOW);
   
   iniciarParpadeo(0.2); 
-
-  setCpuFrequencyMhz(160); 
+  setCpuFrequencyMhz(240); 
 
   preferences.begin("tally-arbiter", false);
   tallyarbiter_host = preferences.getString("host", "192.168.10.107");
@@ -538,25 +585,27 @@ void setup() {
 
   DeviceId = TALLY_DEVICE_ID;
 
+  getBatteryPercentage();
+
   if (wifi_ssid.length() > 0) {
-    Serial.println("[TALLY] Intentando conectar a: " + wifi_ssid);
     WiFi.mode(WIFI_STA);
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
-    
     unsigned long startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
-      delay(500);
-      Serial.print(".");
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
+      delay(250);
     }
-    Serial.println();
   }
 
   if (WiFi.status() != WL_CONNECTED) {
     iniciarModoAP();
   } else {
-    Serial.println("[TALLY] Conectado exitosamente. IP: " + WiFi.localIP().toString());
     networkConnected = true;
     lastWiFiConnectedTime = millis();
+    
+    // --- OPTIMIZACIÓN DE HARDWARE ANTIMODULACIÓN POR BATERÍA ---
+    WiFi.setSleep(false); // Desactiva el modo reposo del módem WiFi
+    esp_wifi_set_ps(WIFI_PS_NONE); // Configura la radio a máxima potencia constante (No Lag)
+    
     if (MDNS.begin("configurar-tally1")) {
       MDNS.addService("http", "tcp", 80);
     }
@@ -572,19 +621,28 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) {
       socket.loop();
     } else {
-      if (millis() - lastWiFiConnectedTime >= 30000) {
+      if (millis() - lastWiFiConnectedTime >= 20000) {
         iniciarModoAP();
       }
     }
 
+    // PROTECCIÓN EN SEGUNDO PLANO: Revisa la batería cada 5 minutos
     static unsigned long lastBatteryCheck = 0;
-    if (millis() - lastBatteryCheck >= 15000) {
+    if (millis() - lastBatteryCheck >= 300000) { 
       lastBatteryCheck = millis();
       int bateriaActual = getBatteryPercentage();
-      if (!noMeasurementHardware && !isCharging && bateriaActual <= 12) {
-        if (!lowBatteryAlert) { lowBatteryAlert = true; iniciarParpadeo(2.0); }
+      
+      // Condición estricta: Solo alerta cuando cae al 10% o menos
+      if (!noMeasurementHardware && !isCharging && bateriaActual <= 10 && bateriaActual > 0) {
+        if (!lowBatteryAlert) { 
+          lowBatteryAlert = true; 
+          iniciarParpadeo(2.0); 
+        }
       } else {
-        if (lowBatteryAlert) { lowBatteryAlert = false; if (socketConnected) apagarLED(); else iniciarParpadeo(0.2); }
+        if (lowBatteryAlert) { 
+          lowBatteryAlert = false; 
+          if (socketConnected) apagarLED(); else iniciarParpadeo(0.2); 
+        }
       }
     }
   }
