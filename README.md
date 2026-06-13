@@ -7,7 +7,7 @@
 Ultra-low latency wireless Tally device based on the **LOLIN32 (ESP32)** hardware architecture. Specially engineered for demanding live broadcast environments, mitigating battery voltage drop bottlenecks through optimized RF and power management firmware.
 
 * If you need to compile the code, check the [Compilation and Development Guide](COMPILATION.md).
-* For camera operators, download the [User Manual](user_manual).
+* For camera operators, download the [User Manual](user_manual.md).
 
 ---
 
