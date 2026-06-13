@@ -13,7 +13,7 @@ This wireless Tally system is built on the **LOLIN32 (ESP32)** architecture. The
 * **PROGRAM:** Indicates that the assigned camera is currently live (**On Air**).
 * **PREVIEW:** Indicates that the assigned camera is selected in the preview bus (**Next up** to go on air).
 
-### 🚀 Key Features of Version v1.1:
+### 🚀 Key Features of Version v1:
 * **Anti-Lag Architecture:** Sequentially optimized linear processing that completely eliminates communication freezes or timing lags during rapid cuts or transitions on the video switcher.
 * **Locked CPU Frequency:** The microcontroller clock speed is dynamically locked at **240MHz** to handle high-frequency bursts of incoming network packets without latency bottlenecks.
 * **Continuous RF Power:** Wireless modem sleep modes are overridden at the hardware level (`WIFI_PS_NONE`), ensuring absolute network connection stability even when battery voltage drops to its operational floor of 3.6V.
@@ -61,7 +61,7 @@ If the device is powered up for the first time on a new set, has undergone a har
 
 ---
 
-## 5. The Web Control Panel v1.1 (Network Maintenance)
+## 5. The Web Control Panel v1 (Network Maintenance)
 Once the Tally device is paired and running within the studio's local network infrastructure, any technical operator or video engineer can log into its live backend diagnostics by entering the following URL address into a web browser: `http://configurar-tally1.local/` *(or by checking the dynamic local IP address assigned to the hardware unit by your network router)*.
 
 Through this asynchronous web control panel, live commands can be sent straight to the hardware core in real time without causing interference to production tasks:
